@@ -4,16 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       kernel_branch:
-        description: 'Kernel branch (e.g., common-android15-6.6-lts)'
+        description: 'Kernel branch (e.g., common-android14-5.15-2025-0)'
         required: true
         type: string
-        default: 'common-android14-6.1-lts'
+        default: 'common-android14-5.15-2025-05'
       
-      enable_kernelsu:
-        description: 'Enable KernelSU integration'
+      kernelsu_variant:
+        description: 'KernelSU variant to integrate'
         required: true
-        type: boolean
-        default: true
+        type: choice
+        default: 'official'
+        options:
+          - 'none'
+          - 'official'
+          - 'next'
       
       enable_susfs:
         description: 'Enable SUSFS integration (requires KernelSU)'
@@ -22,10 +26,10 @@ on:
         default: false
       
       susfs_branch:
-        description: 'SUSFS branch (e.g., gki-android14-6.1)'
+        description: 'SUSFS branch (e.g., gki-android13-5.15)'
         required: false
         type: string
-        default: 'gki-android14-6.1'
+        default: 'gki-android13-5.15'
       
       stock_boot_url:
         description: 'Stock boot.img URL (optional)'
@@ -142,25 +146,57 @@ jobs:
           fi
 
       - name: Integrate KernelSU
-        if: ${{ github.event.inputs.enable_kernelsu == 'true' }}
+        if: ${{ github.event.inputs.kernelsu_variant != 'none' }}
         working-directory: android-kernel
         run: |
-          echo "Integrating KernelSU..."
-          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s
+          case "${{ github.event.inputs.kernelsu_variant }}" in
+            "official")
+              echo "Integrating KernelSU (Official)..."
+              curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s
+              KERNELSU_DIR="KernelSU"
+              ;;
+            "next")
+              echo "Integrating KernelSU-Next..."
+              curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s
+              # KernelSU-Next might use different directory structure
+              if [ -d "KernelSU" ]; then
+                KERNELSU_DIR="KernelSU"
+              elif [ -d "KernelSU-Next" ]; then
+                KERNELSU_DIR="KernelSU-Next"
+              else
+                echo "❌ KernelSU-Next directory structure detection failed"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "❌ Invalid KernelSU variant: ${{ github.event.inputs.kernelsu_variant }}"
+              exit 1
+              ;;
+          esac
           
           # Verify integration
-          if [ -d "KernelSU" ]; then
-            echo "✅ KernelSU integrated successfully"
-            ls -la KernelSU/
+          if [ -d "$KERNELSU_DIR" ]; then
+            echo "✅ KernelSU (${{ github.event.inputs.kernelsu_variant }}) integrated successfully"
+            echo "Directory structure:"
+            ls -la "$KERNELSU_DIR/"
+            
+            # Store KernelSU directory for later steps
+            echo "KERNELSU_DIR=$KERNELSU_DIR" >> $GITHUB_ENV
+            
+            # Display version info if available
+            if [ -f "$KERNELSU_DIR/VERSION" ]; then
+              echo "KernelSU Version: $(cat $KERNELSU_DIR/VERSION)"
+            fi
           else
             echo "❌ KernelSU integration failed"
             exit 1
           fi
 
       - name: Integrate SUSFS
-        if: ${{ github.event.inputs.enable_susfs == 'true' && github.event.inputs.enable_kernelsu == 'true' }}
+        if: ${{ github.event.inputs.enable_susfs == 'true' && github.event.inputs.kernelsu_variant != 'none' }}
         run: |
           echo "Integrating SUSFS with branch: ${{ github.event.inputs.susfs_branch }}"
+          echo "Target KernelSU variant: ${{ github.event.inputs.kernelsu_variant }}"
           
           # Clone SUSFS repository
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b ${{ github.event.inputs.susfs_branch }}
@@ -168,39 +204,84 @@ jobs:
           # Apply SUSFS patches
           cd android-kernel
           
+          # Use dynamic KernelSU directory from previous step
+          KERNELSU_TARGET_DIR="${KERNELSU_DIR:-KernelSU}"
+          echo "Using KernelSU directory: $KERNELSU_TARGET_DIR"
+          
           # Copy KernelSU patch
-          cp ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
+          if [ -f "../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
+            cp ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch "$KERNELSU_TARGET_DIR/"
+            echo "✅ SUSFS KernelSU patch copied"
+          else
+            echo "⚠️ SUSFS KernelSU patch not found, checking alternative locations..."
+            find ../susfs4ksu -name "*susfs*ksu*.patch" -type f | head -1 | xargs -I {} cp {} "$KERNELSU_TARGET_DIR/"
+          fi
           
           # Copy kernel patches
           KERNEL_PATCH=$(find ../susfs4ksu/kernel_patches/ -name "50_add_susfs_in_kernel-${{ github.event.inputs.susfs_branch }}.patch" | head -1)
           if [ -n "$KERNEL_PATCH" ]; then
             cp "$KERNEL_PATCH" common/
+            echo "✅ Specific SUSFS kernel patch found and copied"
           else
-            echo "Warning: Specific SUSFS kernel patch not found, using generic patch"
-            cp ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel*.patch common/ || true
+            echo "⚠️ Specific SUSFS kernel patch not found, using generic patch"
+            find ../susfs4ksu/kernel_patches/ -name "50_add_susfs_in_kernel*.patch" | head -1 | xargs -I {} cp {} common/
           fi
           
-          # Copy filesystem patches
-          cp -r ../susfs4ksu/kernel_patches/fs/* common/fs/ 2>/dev/null || true
-          cp ../susfs4ksu/kernel_patches/include/linux/* common/include/linux/ 2>/dev/null || true
+          # Copy filesystem patches with error handling
+          if [ -d "../susfs4ksu/kernel_patches/fs/" ]; then
+            cp -r ../susfs4ksu/kernel_patches/fs/* common/fs/ 2>/dev/null || echo "⚠️ Some FS patches may not be applicable"
+          fi
           
-          # Apply patches
-          cd KernelSU
-          if patch -p1 --dry-run < 10_enable_susfs_for_ksu.patch >/dev/null 2>&1; then
-            patch -p1 < 10_enable_susfs_for_ksu.patch
-            echo "✅ KernelSU SUSFS patch applied successfully"
+          if [ -d "../susfs4ksu/kernel_patches/include/linux/" ]; then
+            cp ../susfs4ksu/kernel_patches/include/linux/* common/include/linux/ 2>/dev/null || echo "⚠️ Some include patches may not be applicable"
+          fi
+          
+          # Apply patches with enhanced error handling
+          cd "$KERNELSU_TARGET_DIR"
+          SUSFS_KSU_PATCH=$(ls *susfs*ksu*.patch 2>/dev/null | head -1)
+          if [ -n "$SUSFS_KSU_PATCH" ]; then
+            if patch -p1 --dry-run < "$SUSFS_KSU_PATCH" >/dev/null 2>&1; then
+              patch -p1 < "$SUSFS_KSU_PATCH"
+              echo "✅ KernelSU SUSFS patch applied successfully"
+            else
+              echo "⚠️ KernelSU SUSFS patch failed, attempting with alternative strategies..."
+              # Try with different patch levels
+              for level in 0 2 3; do
+                if patch -p$level --dry-run < "$SUSFS_KSU_PATCH" >/dev/null 2>&1; then
+                  patch -p$level < "$SUSFS_KSU_PATCH"
+                  echo "✅ KernelSU SUSFS patch applied with -p$level"
+                  break
+                fi
+              done
+            fi
           else
-            echo "⚠️ KernelSU SUSFS patch failed, manual intervention may be needed"
+            echo "⚠️ No KernelSU SUSFS patch found for application"
           fi
           
           cd ../common
-          SUSFS_PATCH=$(ls 50_add_susfs_in_kernel*.patch | head -1)
-          if [ -n "$SUSFS_PATCH" ] && patch -p1 --dry-run < "$SUSFS_PATCH" >/dev/null 2>&1; then
-            patch -p1 < "$SUSFS_PATCH"
-            echo "✅ SUSFS kernel patch applied successfully"
+          SUSFS_PATCH=$(ls 50_add_susfs_in_kernel*.patch 2>/dev/null | head -1)
+          if [ -n "$SUSFS_PATCH" ]; then
+            if patch -p1 --dry-run < "$SUSFS_PATCH" >/dev/null 2>&1; then
+              patch -p1 < "$SUSFS_PATCH"
+              echo "✅ SUSFS kernel patch applied successfully"
+            else
+              echo "⚠️ SUSFS kernel patch failed, attempting with alternative strategies..."
+              # Try with different patch levels
+              for level in 0 2 3; do
+                if patch -p$level --dry-run < "$SUSFS_PATCH" >/dev/null 2>&1; then
+                  patch -p$level < "$SUSFS_PATCH"
+                  echo "✅ SUSFS kernel patch applied with -p$level"
+                  break
+                fi
+              done
+            fi
           else
-            echo "⚠️ SUSFS kernel patch failed, manual intervention may be needed"
+            echo "⚠️ No SUSFS kernel patch found for application"
           fi
+          
+          # Verify SUSFS integration
+          echo "SUSFS integration verification:"
+          find . -name "*susfs*" -type f | head -10
 
       - name: Build Kernel with Legacy build.sh
         if: ${{ steps.validate_branch.outputs.build_system == 'legacy' || steps.validate_branch.outputs.use_bazel == 'false' }}
@@ -376,7 +457,7 @@ jobs:
             - Kernel Version: ${{ steps.validate_branch.outputs.kernel_version }}
             - Build System: ${{ steps.validate_branch.outputs.build_system }}
             - LTO Mode: ${{ github.event.inputs.lto_mode }}
-            - KernelSU: ${{ github.event.inputs.enable_kernelsu == 'true' && '✅ Enabled' || '❌ Disabled' }}
+            - KernelSU Variant: ${{ github.event.inputs.kernelsu_variant }}
             - SUSFS: ${{ github.event.inputs.enable_susfs == 'true' && '✅ Enabled' || '❌ Disabled' }}
             
             **Installation:**
@@ -416,7 +497,7 @@ jobs:
           echo "| Kernel Version | ${{ steps.validate_branch.outputs.kernel_version }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Build System | ${{ steps.validate_branch.outputs.build_system }} |" >> $GITHUB_STEP_SUMMARY
           echo "| LTO Mode | ${{ github.event.inputs.lto_mode }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| KernelSU | ${{ github.event.inputs.enable_kernelsu == 'true' && '✅ Enabled' || '❌ Disabled' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| KernelSU Variant | ${{ github.event.inputs.kernelsu_variant }} |" >> $GITHUB_STEP_SUMMARY
           echo "| SUSFS | ${{ github.event.inputs.enable_susfs == 'true' && '✅ Enabled' || '❌ Disabled' }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
