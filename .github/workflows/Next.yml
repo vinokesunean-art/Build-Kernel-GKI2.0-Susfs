@@ -1,0 +1,337 @@
+name: GKI 2.0 Kernel Builder with KernelSU/KernelSU-Next & SUSFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: 'Nhánh kernel (ví dụ: common-android14-5.15-2025-05)'
+        required: true
+        type: string
+        default: 'common-android14-5.15-2025-05'
+      
+      kernelsu_variant:
+        description: 'Biến thể KernelSU để tích hợp'
+        required: true
+        type: choice
+        default: 'official'
+        options:
+          - 'none'
+          - 'official'
+          - 'next'
+      
+      enable_susfs:
+        description: 'Bật tích hợp SUSFS (yêu cầu KernelSU)'
+        required: true
+        type: boolean
+        default: false
+      
+      susfs_branch:
+        description: 'Nhánh SUSFS (ví dụ: gki-android13-5.15)'
+        required: false
+        type: string
+        default: 'gki-android13-5.15'
+      
+      stock_boot_url:
+        description: 'URL của boot.img gốc (tùy chọn)'
+        required: false
+        type: string
+      
+      lto_mode:
+        description: 'Chế độ LTO'
+        required: true
+        type: choice
+        default: 'thin'
+        options:
+          - 'thin'
+          - 'full'
+          - 'none'
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  WORKSPACE: ${{ github.workspace }}
+  
+jobs:
+  build-gki-kernel:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360 # 6 giờ
+    
+    steps:
+      - name: Tối ưu hóa không gian build
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 2048
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+
+      - name: Checkout mã nguồn của bạn
+        uses: actions/checkout@v4
+
+      - name: Cài đặt các gói phụ thuộc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-core gnupg flex bison build-essential \
+            zip curl zlib1g-dev libc6-dev-i386 x11proto-core-dev libx11-dev \
+            lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
+            repo python3-pip bc cpio kmod libssl-dev rsync
+
+      - name: Cấu hình Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config --global color.ui false
+
+      - name: Phân tích nhánh Kernel và xác định hệ thống build
+        id: validate_branch
+        run: |
+          BRANCH="${{ github.event.inputs.kernel_branch }}"
+          echo "Đang xử lý nhánh: $BRANCH"
+          
+          if [[ $BRANCH =~ android([0-9]+)-([0-9]+\.[0-9]+) ]]; then
+            ANDROID_VERSION=${BASH_REMATCH[1]}
+            KERNEL_VERSION=${BASH_REMATCH[2]}
+            echo "android_version=$ANDROID_VERSION" >> $GITHUB_OUTPUT
+            echo "kernel_version=$KERNEL_VERSION" >> $GITHUB_OUTPUT
+            
+            case "$ANDROID_VERSION-$KERNEL_VERSION" in
+              "12-5.10")
+                echo "build_system=legacy" >> $GITHUB_OUTPUT
+                echo "use_bazel=false" >> $GITHUB_OUTPUT
+                ;;
+              "13-5.10"|"13-5.15")
+                echo "build_system=both" >> $GITHUB_OUTPUT
+                echo "use_bazel=true" >> $GITHUB_OUTPUT
+                ;;
+              *)
+                echo "Mặc định sử dụng Bazel cho các phiên bản mới hơn"
+                echo "build_system=bazel" >> $GITHUB_OUTPUT
+                echo "use_bazel=true" >> $GITHUB_OUTPUT
+                ;;
+            esac
+          else
+            echo "Định dạng nhánh không hợp lệ. Vẫn tiếp tục với Bazel làm mặc định." >&2
+            echo "build_system=bazel" >> $GITHUB_OUTPUT
+            echo "use_bazel=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Tải mã nguồn Kernel
+        run: |
+          mkdir -p android-kernel
+          cd android-kernel
+          
+          echo "Khởi tạo repo với nhánh: ${{ github.event.inputs.kernel_branch }}"
+          repo init --depth=1 -u https://android.googlesource.com/kernel/manifest \
+            -b ${{ github.event.inputs.kernel_branch }}
+          
+          # Xử lý các nhánh đã lỗi thời (deprecated) như trong README
+          if ! repo --trace sync -c -j$(nproc) --no-tags --fail-fast 2>/dev/null; then
+            echo "Đồng bộ thất bại, có thể nhánh đã lỗi thời. Thử cách khác..."
+            FORMATTED_BRANCH=${{ github.event.inputs.kernel_branch }}
+            FORMATTED_BRANCH=${FORMATTED_BRANCH#common-}
+            
+            REMOTE_BRANCH=$(git ls-remote https://android.googlesource.com/kernel/common ${FORMATTED_BRANCH})
+            if [[ $REMOTE_BRANCH == *"deprecated"* ]]; then
+              echo "Phát hiện nhánh lỗi thời: $FORMATTED_BRANCH. Đang sửa manifest..."
+              sed -i "s/\"${FORMATTED_BRANCH}\"/\"deprecated\/${FORMATTED_BRANCH}\"/g" .repo/manifests/default.xml
+            fi
+            
+            repo --trace sync -c -j$(nproc) --no-tags --fail-fast
+          fi
+          echo "✅ Tải mã nguồn Kernel thành công."
+
+      - name: Tích hợp KernelSU
+        if: ${{ github.event.inputs.kernelsu_variant != 'none' }}
+        working-directory: android-kernel
+        run: |
+          case "${{ github.event.inputs.kernelsu_variant }}" in
+            "official")
+              echo "Tích hợp KernelSU (Official)..."
+              curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+              KERNELSU_DIR="KernelSU"
+              ;;
+            "next")
+              echo "Tích hợp KernelSU-Next..."
+              # Dựa trên kịch bản kernelsunext_setup.sh, nó cũng tạo thư mục KernelSU-Next
+              curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+              if [ -d "KernelSU-Next" ]; then
+                KERNELSU_DIR="KernelSU-Next"
+              else
+                echo "❌ Không tìm thấy thư mục KernelSU-Next sau khi chạy script."
+                exit 1
+              fi
+              ;;
+          esac
+          
+          if [ -d "$KERNELSU_DIR" ]; then
+            echo "✅ KernelSU (${{ github.event.inputs.kernelsu_variant }}) đã được tích hợp thành công vào thư mục $KERNELSU_DIR"
+            echo "KERNELSU_DIR=$KERNELSU_DIR" >> $GITHUB_ENV
+          else
+            echo "❌ Tích hợp KernelSU thất bại."
+            exit 1
+          fi
+
+      - name: Tích hợp SUSFS
+        if: ${{ github.event.inputs.enable_susfs == 'true' && github.event.inputs.kernelsu_variant != 'none' }}
+        run: |
+          echo "Tích hợp SUSFS với nhánh: ${{ github.event.inputs.susfs_branch }}"
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b ${{ github.event.inputs.susfs_branch }}
+          
+          cd android-kernel
+          KERNELSU_TARGET_DIR="${KERNELSU_DIR}"
+          echo "Sử dụng thư mục KernelSU: $KERNELSU_TARGET_DIR"
+          
+          # Sao chép và áp dụng các bản vá
+          cp ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch "$KERNELSU_TARGET_DIR/"
+          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-${{ github.event.inputs.susfs_branch }}.patch common/
+          cp -r ../susfs4ksu/kernel_patches/fs/* common/fs/ 2>/dev/null || echo "⚠️ Bỏ qua các bản vá FS không áp dụng được."
+          cp ../susfs4ksu/kernel_patches/include/linux/* common/include/linux/ 2>/dev/null || echo "⚠️ Bỏ qua các bản vá include không áp dụng được."
+          
+          # Áp dụng bản vá cho KernelSU
+          cd "$KERNELSU_TARGET_DIR"
+          if ! patch -p1 < 10_enable_susfs_for_ksu.patch; then
+             echo "⚠️ Vá KernelSU với -p1 thất bại, thử các cấp độ khác..."
+             patch -p0 < 10_enable_susfs_for_ksu.patch || patch -p2 < 10_enable_susfs_for_ksu.patch || { echo "❌ Không thể áp dụng bản vá KernelSU cho SUSFS."; exit 1; }
+          fi
+          echo "✅ Áp dụng bản vá KernelSU cho SUSFS thành công."
+          
+          # Áp dụng bản vá cho kernel chung
+          cd ../common
+          if ! patch -p1 < 50_add_susfs_in_kernel-${{ github.event.inputs.susfs_branch }}.patch; then
+            echo "⚠️ Vá kernel chung với -p1 thất bại, thử các cấp độ khác..."
+            patch -p0 < 50_add_susfs_in_kernel-${{ github.event.inputs.susfs_branch }}.patch || { echo "❌ Không thể áp dụng bản vá kernel chung cho SUSFS."; exit 1; }
+          fi
+          echo "✅ Áp dụng bản vá kernel chung cho SUSFS thành công."
+
+      - name: Build Kernel bằng build.sh (Legacy)
+        if: ${{ steps.validate_branch.outputs.use_bazel == 'false' }}
+        working-directory: android-kernel
+        run: |
+          echo "Xây dựng kernel bằng phương pháp legacy build.sh..."
+          LTO=${{ github.event.inputs.lto_mode }} BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh
+          
+          if [ ! -f "out/"*"/dist/Image" ]; then
+            echo "❌ Build kernel bằng build.sh thất bại."
+            exit 1
+          fi
+          echo "✅ Build kernel bằng build.sh thành công."
+
+      - name: Build Kernel bằng Bazel
+        if: ${{ steps.validate_branch.outputs.use_bazel == 'true' }}
+        working-directory: android-kernel
+        run: |
+          echo "Xây dựng kernel bằng phương pháp Bazel..."
+          tools/bazel build --config=fast --lto=${{ github.event.inputs.lto_mode }} //common:kernel_aarch64_dist
+          
+          if [ ! -f "bazel-bin/common/kernel_aarch64/Image" ]; then
+            echo "❌ Build kernel bằng Bazel thất bại."
+            exit 1
+          fi
+          echo "✅ Build kernel bằng Bazel thành công."
+
+      - name: Tải và thiết lập công cụ (magiskboot)
+        if: ${{ github.event.inputs.stock_boot_url != '' }}
+        run: |
+          mkdir -p tools
+          cd tools
+          curl -LO https://raw.githubusercontent.com/TheWildJames/Android_Kernel_Tutorials/gki-2.0/tools/magiskboot
+          chmod +x magiskboot
+
+      - name: Xử lý Boot Image
+        if: ${{ github.event.inputs.stock_boot_url != '' }}
+        run: |
+          mkdir -p boot-processing
+          cd boot-processing
+          
+          echo "Tải boot.img gốc từ: ${{ github.event.inputs.stock_boot_url }}"
+          curl -L -o boot.img "${{ github.event.inputs.stock_boot_url }}"
+          
+          # Bước 08: Unpack boot.img
+          ../tools/magiskboot unpack boot.img
+          KERNEL_FMT=$(grep -o 'KERNEL_FMT.*' .magisk/config | cut -d'[' -f2 | cut -d']' -f1)
+          echo "Phát hiện định dạng kernel: $KERNEL_FMT"
+          
+          # Bước 09: Repack boot.img
+          LEGACY_PATH="android-kernel/out/*/dist/Image"
+          BAZEL_PATH="android-kernel/bazel-bin/common/kernel_aarch64/Image"
+          
+          # Tìm đường dẫn kernel nguồn chính xác
+          if [[ -f ../$LEGACY_PATH ]]; then
+             SOURCE_KERNEL_PATH="../$LEGACY_PATH"
+          elif [[ -f ../$BAZEL_PATH ]]; then
+             SOURCE_KERNEL_PATH="../$BAZEL_PATH"
+          else
+             echo "❌ Không tìm thấy tệp Image kernel đã build."
+             exit 1
+          fi
+          echo "Sử dụng kernel từ: $SOURCE_KERNEL_PATH"
+
+          case "$KERNEL_FMT" in
+            "raw")
+              cp $SOURCE_KERNEL_PATH kernel
+              ;;
+            "lz4")
+              cp ${SOURCE_KERNEL_PATH}.lz4 kernel
+              ;;
+            "gzip")
+              gzip -n -k -f -9 $SOURCE_KERNEL_PATH
+              mv ${SOURCE_KERNEL_PATH}.gz kernel
+              ;;
+            *)
+              echo "❌ Định dạng kernel không xác định: $KERNEL_FMT"
+              exit 1
+              ;;
+          esac
+          
+          ../tools/magiskboot repack boot.img
+          mv new-boot.img ..
+          echo "✅ Đóng gói lại new-boot.img thành công."
+
+      - name: Chuẩn bị Artifacts
+        run: |
+          mkdir -p artifacts
+          
+          # Sao chép kernel images
+          if compgen -G "android-kernel/out/*/dist/Image*" > /dev/null; then
+            cp android-kernel/out/*/dist/Image* artifacts/
+          elif compgen -G "android-kernel/bazel-bin/common/kernel_aarch64/Image*" > /dev/null; then
+            cp android-kernel/bazel-bin/common/kernel_aarch64/Image* artifacts/
+          fi
+          
+          # Sao chép boot image đã đóng gói lại
+          if [ -f "new-boot.img" ]; then
+            cp new-boot.img artifacts/
+          fi
+          
+          echo "✅ Chuẩn bị artifacts thành công."
+          ls -R artifacts
+
+      - name: Tải lên Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-kernel-${{ steps.validate_branch.outputs.android_version }}-${{ steps.validate_branch.outputs.kernel_version }}-${{ github.run_number }}
+          path: artifacts/
+
+      - name: Tạo Release
+        if: success()
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: gki-${{ steps.validate_branch.outputs.android_version }}-${{ steps.validate_branch.outputs.kernel_version }}-${{ github.run_number }}
+          name: GKI ${{ steps.validate_branch.outputs.android_version }} Kernel v${{ steps.validate_branch.outputs.kernel_version }} (Build #${{ github.run_number }})
+          body: |
+            ## GKI 2.0 Kernel Build
+            
+            **Cấu hình Build:**
+            - **Nhánh Kernel:** `${{ github.event.inputs.kernel_branch }}`
+            - **Phiên bản Android:** ${{ steps.validate_branch.outputs.android_version }}
+            - **Phiên bản Kernel:** ${{ steps.validate_branch.outputs.kernel_version }}
+            - **Chế độ LTO:** ${{ github.event.inputs.lto_mode }}
+            - **Biến thể KernelSU:** ${{ github.event.inputs.kernelsu_variant }}
+            - **Tích hợp SUSFS:** ${{ github.event.inputs.enable_susfs == 'true' && '✅ Đã bật' || '❌ Đã tắt' }}
+            
+            Xây dựng bởi GitHub Actions.
+          files: |
+            artifacts/new-boot.img
+            artifacts/Image
+            artifacts/Image.gz
+            artifacts/Image.lz4
