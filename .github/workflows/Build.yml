@@ -1,0 +1,435 @@
+name: GKI 2.0 Kernel Builder with KernelSU & SUSFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: 'Kernel branch (e.g., common-android15-6.6-lts)'
+        required: true
+        type: string
+        default: 'common-android14-6.1-lts'
+      
+      enable_kernelsu:
+        description: 'Enable KernelSU integration'
+        required: true
+        type: boolean
+        default: true
+      
+      enable_susfs:
+        description: 'Enable SUSFS integration (requires KernelSU)'
+        required: true
+        type: boolean
+        default: false
+      
+      susfs_branch:
+        description: 'SUSFS branch (e.g., gki-android14-6.1)'
+        required: false
+        type: string
+        default: 'gki-android14-6.1'
+      
+      stock_boot_url:
+        description: 'Stock boot.img URL (optional)'
+        required: false
+        type: string
+      
+      lto_mode:
+        description: 'LTO mode'
+        required: true
+        type: choice
+        default: 'thin'
+        options:
+          - 'thin'
+          - 'full'
+          - 'none'
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  WORKSPACE: ${{ github.workspace }}
+  
+jobs:
+  build-gki-kernel:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    
+    steps:
+      - name: Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 2048
+          temp-reserve-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-core gnupg flex bison build-essential \
+            zip curl zlib1g-dev libc6-dev-i386 x11proto-core-dev libx11-dev \
+            lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
+            repo python3-pip bc cpio kmod libssl-dev rsync
+
+      - name: Setup Git Configuration
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config --global color.ui false
+
+      - name: Validate Kernel Branch Format
+        id: validate_branch
+        run: |
+          BRANCH="${{ github.event.inputs.kernel_branch }}"
+          echo "Processing branch: $BRANCH"
+          
+          # Extract version info from branch name
+          if [[ $BRANCH =~ android([0-9]+)-([0-9]+\.[0-9]+) ]]; then
+            ANDROID_VERSION=${BASH_REMATCH[1]}
+            KERNEL_VERSION=${BASH_REMATCH[2]}
+            echo "android_version=$ANDROID_VERSION" >> $GITHUB_OUTPUT
+            echo "kernel_version=$KERNEL_VERSION" >> $GITHUB_OUTPUT
+            
+            # Determine build system
+            case "$ANDROID_VERSION-$KERNEL_VERSION" in
+              "12-5.10")
+                echo "build_system=legacy" >> $GITHUB_OUTPUT
+                echo "use_bazel=false" >> $GITHUB_OUTPUT
+                ;;
+              "13-5.10"|"13-5.15")
+                echo "build_system=both" >> $GITHUB_OUTPUT
+                echo "use_bazel=true" >> $GITHUB_OUTPUT
+                ;;
+              "14-5.15"|"14-6.1"|"15-6.6")
+                echo "build_system=bazel" >> $GITHUB_OUTPUT
+                echo "use_bazel=true" >> $GITHUB_OUTPUT
+                ;;
+              *)
+                echo "build_system=bazel" >> $GITHUB_OUTPUT
+                echo "use_bazel=true" >> $GITHUB_OUTPUT
+                ;;
+            esac
+          else
+            echo "Invalid branch format" >&2
+            exit 1
+          fi
+
+      - name: Download Kernel Source
+        run: |
+          mkdir -p android-kernel
+          cd android-kernel
+          
+          echo "Initializing repo with branch: ${{ github.event.inputs.kernel_branch }}"
+          repo init --depth=1 -u https://android.googlesource.com/kernel/manifest \
+            -b ${{ github.event.inputs.kernel_branch }}
+          
+          # Handle deprecated branches
+          if ! repo --trace sync -c -j$(nproc) --no-tags --fail-fast 2>/dev/null; then
+            echo "Branch might be deprecated, trying alternative approach..."
+            FORMATTED_BRANCH=${{ github.event.inputs.kernel_branch }}
+            FORMATTED_BRANCH=${FORMATTED_BRANCH#common-}
+            
+            REMOTE_BRANCH=$(git ls-remote https://android.googlesource.com/kernel/common ${FORMATTED_BRANCH})
+            if [[ $REMOTE_BRANCH == *"deprecated"* ]]; then
+              echo "Found deprecated branch: $FORMATTED_BRANCH"
+              sed -i "s/\"${FORMATTED_BRANCH}\"/\"deprecated\/${FORMATTED_BRANCH}\"/g" .repo/manifests/default.xml
+            fi
+            
+            repo --trace sync -c -j$(nproc) --no-tags --fail-fast
+          fi
+
+      - name: Integrate KernelSU
+        if: ${{ github.event.inputs.enable_kernelsu == 'true' }}
+        working-directory: android-kernel
+        run: |
+          echo "Integrating KernelSU..."
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s
+          
+          # Verify integration
+          if [ -d "KernelSU" ]; then
+            echo "✅ KernelSU integrated successfully"
+            ls -la KernelSU/
+          else
+            echo "❌ KernelSU integration failed"
+            exit 1
+          fi
+
+      - name: Integrate SUSFS
+        if: ${{ github.event.inputs.enable_susfs == 'true' && github.event.inputs.enable_kernelsu == 'true' }}
+        run: |
+          echo "Integrating SUSFS with branch: ${{ github.event.inputs.susfs_branch }}"
+          
+          # Clone SUSFS repository
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b ${{ github.event.inputs.susfs_branch }}
+          
+          # Apply SUSFS patches
+          cd android-kernel
+          
+          # Copy KernelSU patch
+          cp ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
+          
+          # Copy kernel patches
+          KERNEL_PATCH=$(find ../susfs4ksu/kernel_patches/ -name "50_add_susfs_in_kernel-${{ github.event.inputs.susfs_branch }}.patch" | head -1)
+          if [ -n "$KERNEL_PATCH" ]; then
+            cp "$KERNEL_PATCH" common/
+          else
+            echo "Warning: Specific SUSFS kernel patch not found, using generic patch"
+            cp ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel*.patch common/ || true
+          fi
+          
+          # Copy filesystem patches
+          cp -r ../susfs4ksu/kernel_patches/fs/* common/fs/ 2>/dev/null || true
+          cp ../susfs4ksu/kernel_patches/include/linux/* common/include/linux/ 2>/dev/null || true
+          
+          # Apply patches
+          cd KernelSU
+          if patch -p1 --dry-run < 10_enable_susfs_for_ksu.patch >/dev/null 2>&1; then
+            patch -p1 < 10_enable_susfs_for_ksu.patch
+            echo "✅ KernelSU SUSFS patch applied successfully"
+          else
+            echo "⚠️ KernelSU SUSFS patch failed, manual intervention may be needed"
+          fi
+          
+          cd ../common
+          SUSFS_PATCH=$(ls 50_add_susfs_in_kernel*.patch | head -1)
+          if [ -n "$SUSFS_PATCH" ] && patch -p1 --dry-run < "$SUSFS_PATCH" >/dev/null 2>&1; then
+            patch -p1 < "$SUSFS_PATCH"
+            echo "✅ SUSFS kernel patch applied successfully"
+          else
+            echo "⚠️ SUSFS kernel patch failed, manual intervention may be needed"
+          fi
+
+      - name: Build Kernel with Legacy build.sh
+        if: ${{ steps.validate_branch.outputs.build_system == 'legacy' || steps.validate_branch.outputs.use_bazel == 'false' }}
+        working-directory: android-kernel
+        run: |
+          echo "Building kernel using legacy build.sh method..."
+          LTO=${{ github.event.inputs.lto_mode }} BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh
+          
+          # Verify build artifacts
+          if [ -f "out/*/dist/Image" ]; then
+            echo "✅ Kernel build completed successfully"
+            ls -la out/*/dist/
+          else
+            echo "❌ Kernel build failed"
+            exit 1
+          fi
+
+      - name: Build Kernel with Bazel
+        if: ${{ steps.validate_branch.outputs.use_bazel == 'true' }}
+        working-directory: android-kernel
+        run: |
+          echo "Building kernel using Bazel method..."
+          tools/bazel build --config=fast --lto=${{ github.event.inputs.lto_mode }} //common:kernel_aarch64_dist
+          
+          # Verify build artifacts
+          if [ -f "bazel-bin/common/kernel_aarch64/Image" ]; then
+            echo "✅ Kernel build completed successfully"
+            ls -la bazel-bin/common/kernel_aarch64/
+          else
+            echo "❌ Kernel build failed"
+            exit 1
+          fi
+
+      - name: Download and Setup Tools
+        run: |
+          mkdir -p android-tools
+          cd android-tools
+          
+          # Download magiskboot
+          curl -LO https://raw.githubusercontent.com/TheWildJames/Android_Kernel_Tutorials/gki-2.0/tools/magiskboot
+          chmod +x magiskboot
+          
+          echo "✅ Tools downloaded successfully"
+
+      - name: Download Stock Boot Image
+        if: ${{ github.event.inputs.stock_boot_url != '' }}
+        run: |
+          mkdir -p android-bootimgs
+          cd android-bootimgs
+          
+          echo "Downloading stock boot.img from: ${{ github.event.inputs.stock_boot_url }}"
+          curl -L -o boot.img "${{ github.event.inputs.stock_boot_url }}"
+          
+          if [ -f "boot.img" ]; then
+            echo "✅ Stock boot.img downloaded successfully"
+            ls -la boot.img
+          else
+            echo "❌ Failed to download stock boot.img"
+            exit 1
+          fi
+
+      - name: Process Boot Image
+        if: ${{ github.event.inputs.stock_boot_url != '' }}
+        run: |
+          cd android-bootimgs
+          
+          # Unpack boot.img
+          ../android-tools/magiskboot unpack boot.img
+          
+          # Identify kernel format
+          KERNEL_FMT=$(../android-tools/magiskboot unpack boot.img 2>&1 | grep "KERNEL_FMT" | awk '{print $2}' | tr -d '[]')
+          echo "Detected kernel format: $KERNEL_FMT"
+          echo "kernel_format=$KERNEL_FMT" >> $GITHUB_ENV
+          
+          # Copy appropriate kernel based on build system and format
+          if [ -f "../android-kernel/out/*/dist/Image" ]; then
+            # Legacy build system
+            case "$KERNEL_FMT" in
+              "raw")
+                cp ../android-kernel/out/*/dist/Image kernel
+                ;;
+              "lz4")
+                cp ../android-kernel/out/*/dist/Image.lz4 kernel
+                ;;
+              "gzip")
+                gzip -n -k -f -9 ../android-kernel/out/*/dist/Image
+                mv ../android-kernel/out/*/dist/Image.gz kernel
+                ;;
+            esac
+          elif [ -f "../android-kernel/bazel-bin/common/kernel_aarch64/Image" ]; then
+            # Bazel build system
+            case "$KERNEL_FMT" in
+              "raw")
+                cp ../android-kernel/bazel-bin/common/kernel_aarch64/Image kernel
+                ;;
+              "lz4")
+                cp ../android-kernel/bazel-bin/common/kernel_aarch64/Image.lz4 kernel
+                ;;
+              "gzip")
+                gzip -n -k -f -9 ../android-kernel/bazel-bin/common/kernel_aarch64/Image
+                mv ../android-kernel/bazel-bin/common/kernel_aarch64/Image.gz kernel
+                ;;
+            esac
+          fi
+          
+          # Repack boot.img
+          ../android-tools/magiskboot repack boot.img
+          
+          if [ -f "new-boot.img" ]; then
+            echo "✅ Boot image repacked successfully"
+            ls -la new-boot.img
+          else
+            echo "❌ Failed to repack boot image"
+            exit 1
+          fi
+
+      - name: Prepare Artifacts
+        run: |
+          mkdir -p artifacts
+          
+          # Copy kernel images
+          if [ -f "android-kernel/out/*/dist/Image" ]; then
+            cp android-kernel/out/*/dist/Image* artifacts/
+          elif [ -f "android-kernel/bazel-bin/common/kernel_aarch64/Image" ]; then
+            cp android-kernel/bazel-bin/common/kernel_aarch64/Image* artifacts/
+          fi
+          
+          # Copy boot images if available
+          if [ -f "android-bootimgs/new-boot.img" ]; then
+            cp android-bootimgs/new-boot.img artifacts/
+          fi
+          
+          # Create build info
+          cat > artifacts/build-info.txt << EOF
+          Build Information:
+          ==================
+          Kernel Branch: ${{ github.event.inputs.kernel_branch }}
+          Android Version: ${{ steps.validate_branch.outputs.android_version }}
+          Kernel Version: ${{ steps.validate_branch.outputs.kernel_version }}
+          Build System: ${{ steps.validate_branch.outputs.build_system }}
+          LTO Mode: ${{ github.event.inputs.lto_mode }}
+          KernelSU: ${{ github.event.inputs.enable_kernelsu }}
+          SUSFS: ${{ github.event.inputs.enable_susfs }}
+          SUSFS Branch: ${{ github.event.inputs.susfs_branch }}
+          Build Date: $(date -u)
+          Build Commit: ${{ github.sha }}
+          EOF
+          
+          ls -la artifacts/
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-kernel-${{ steps.validate_branch.outputs.android_version }}-${{ steps.validate_branch.outputs.kernel_version }}-${{ github.run_number }}
+          path: artifacts/
+          retention-days: 30
+
+      - name: Create Release
+        if: ${{ success() }}
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: gki-${{ steps.validate_branch.outputs.android_version }}-${{ steps.validate_branch.outputs.kernel_version }}-${{ github.run_number }}
+          release_name: GKI ${{ steps.validate_branch.outputs.android_version }} Kernel v${{ steps.validate_branch.outputs.kernel_version }}
+          body: |
+            ## GKI 2.0 Kernel Build
+            
+            **Build Configuration:**
+            - Kernel Branch: `${{ github.event.inputs.kernel_branch }}`
+            - Android Version: ${{ steps.validate_branch.outputs.android_version }}
+            - Kernel Version: ${{ steps.validate_branch.outputs.kernel_version }}
+            - Build System: ${{ steps.validate_branch.outputs.build_system }}
+            - LTO Mode: ${{ github.event.inputs.lto_mode }}
+            - KernelSU: ${{ github.event.inputs.enable_kernelsu == 'true' && '✅ Enabled' || '❌ Disabled' }}
+            - SUSFS: ${{ github.event.inputs.enable_susfs == 'true' && '✅ Enabled' || '❌ Disabled' }}
+            
+            **Installation:**
+            1. Download the appropriate kernel image for your device
+            2. Flash using fastboot: `fastboot flash boot new-boot.img`
+            3. Reboot and enjoy!
+            
+            **Important Notes:**
+            - Always backup your original boot.img before flashing
+            - Test thoroughly before daily use
+            - Install KernelSU Manager if KernelSU is enabled
+            
+            Built with ❤️ by GitHub Actions
+          draft: false
+          prerelease: false
+
+      - name: Upload Kernel Image to Release
+        if: ${{ success() && steps.create_release.outputs.upload_url }}
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/new-boot.img
+          asset_name: new-boot.img
+          asset_content_type: application/octet-stream
+
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "## 🎯 GKI 2.0 Kernel Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Kernel Branch | \`${{ github.event.inputs.kernel_branch }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Android Version | ${{ steps.validate_branch.outputs.android_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Kernel Version | ${{ steps.validate_branch.outputs.kernel_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build System | ${{ steps.validate_branch.outputs.build_system }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| LTO Mode | ${{ github.event.inputs.lto_mode }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| KernelSU | ${{ github.event.inputs.enable_kernelsu == 'true' && '✅ Enabled' || '❌ Disabled' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SUSFS | ${{ github.event.inputs.enable_susfs == 'true' && '✅ Enabled' || '❌ Disabled' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "### ✅ Build completed successfully!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Next Steps:**" >> $GITHUB_STEP_SUMMARY
+            echo "1. Download the artifacts from this build" >> $GITHUB_STEP_SUMMARY
+            echo "2. Flash \`new-boot.img\` to your device using fastboot" >> $GITHUB_STEP_SUMMARY
+            echo "3. Install KernelSU Manager if KernelSU is enabled" >> $GITHUB_STEP_SUMMARY
+            echo "4. Configure SUSFS module if SUSFS is enabled" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ Build failed!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Please check the logs above for detailed error information." >> $GITHUB_STEP_SUMMARY
+          fi
