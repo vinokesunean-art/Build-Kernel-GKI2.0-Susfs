@@ -70,6 +70,24 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # ==========================================================
+      # 🔔 NOTIFIKASI MULAI BUILD (PALING AWAL)
+      # ==========================================================
+      - name: Kirim Notifikasi Mulai Build
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          message: |
+            🚀 **Memulai Build GKI 2.0 Kernel!**
+
+            📱 **Branch:** ${{ github.event.inputs.kernel_branch }}
+            🔧 **KernelSU:** ${{ github.event.inputs.kernelsu_variant }}
+            📦 **SUSFS:** ${{ github.event.inputs.enable_susfs }}
+            👤 **User:** ${{ github.actor }}
+
+            ⏳ Mohon tunggu, proses sedang berjalan...
+
       - name: Install Dependencies
         run: |
           sudo apt-get update
@@ -479,38 +497,4 @@ jobs:
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/new-boot.img
-          asset_name: new-boot.img
-          asset_content_type: application/octet-stream
-
-      - name: Build Summary
-        if: always()
-        run: |
-          echo "## 🎯 GKI 2.0 Kernel Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Kernel Branch | \`${{ github.event.inputs.kernel_branch }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Android Version | ${{ steps.validate_branch.outputs.android_version }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Kernel Version | ${{ steps.validate_branch.outputs.kernel_version }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Build System | ${{ steps.validate_branch.outputs.build_system }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| LTO Mode | ${{ github.event.inputs.lto_mode }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| KernelSU Variant | ${{ github.event.inputs.kernelsu_variant }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| SUSFS | ${{ github.event.inputs.enable_susfs == 'true' && '✅ Enabled' || '❌ Disabled' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          if [ "${{ job.status }}" == "success" ]; then
-            echo "### ✅ Build completed successfully!" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Next Steps:**" >> $GITHUB_STEP_SUMMARY
-            echo "1. Download the artifacts from this build" >> $GITHUB_STEP_SUMMARY
-            echo "2. Flash \`new-boot.img\` to your device using fastboot" >> $GITHUB_STEP_SUMMARY
-            echo "3. Install KernelSU Manager if KernelSU is enabled" >> $GITHUB_STEP_SUMMARY
-            echo "4. Configure SUSFS module if SUSFS is enabled" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "### ❌ Build failed!" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Please check the logs above for detailed error information." >> $GITHUB_STEP_SUMMARY
-          fi
+                   
